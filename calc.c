@@ -14,6 +14,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <dirent.h>
 #include <sys/stat.h>
 
 /* Used in the names of output files and folders. */
@@ -388,6 +389,35 @@ static char *input_base(const char *path) {
     return s;
 }
 
+/* "../in/" -> "in": the last folder name of a path. With -d it names the
+ * default output folder. */
+static char *dir_base(const char *path) {
+    size_t end = strlen(path);
+    while (end > 1 && path[end - 1] == '/')
+        end--;
+    size_t start = end;
+    while (start > 0 && path[start - 1] != '/')
+        start--;
+    char *s = malloc(end - start + 1);
+    if (!s)
+        return NULL;
+    memcpy(s, path + start, end - start);
+    s[end - start] = '\0';
+    return s;
+}
+
+/* a + b + c as a new malloc'd string, or NULL when out of memory. */
+static char *concat3(const char *a, const char *b, const char *c) {
+    size_t la = strlen(a), lb = strlen(b), lc = strlen(c);
+    char *s = malloc(la + lb + lc + 1);
+    if (!s)
+        return NULL;
+    memcpy(s, a, la);
+    memcpy(s + la, b, lb);
+    memcpy(s + la + lb, c, lc + 1); /* also copies the '\0' of c */
+    return s;
+}
+
 /* An existing output folder is reused; a missing one is created. */
 static int ensure_dir(const char *path) {
     struct stat st;
@@ -416,22 +446,47 @@ static int process_file(const char *input, const char *outdir) {
     }
 
     char *base = input_base(input);
-    char *path = NULL;
-    if (base) {
-        size_t size = strlen(outdir) + strlen(base) +
-                      sizeof("/___.txt" STUDENT_NAME STUDENT_LASTNAME STUDENT_ID);
-        path = malloc(size);
-        if (path)
-            snprintf(path, size, "%s/%s_%s_%s_%s.txt", outdir, base, STUDENT_NAME,
-                     STUDENT_LASTNAME, STUDENT_ID);
-    }
+    char *file = base ? concat3(base, "_" STUDENT_NAME "_" STUDENT_LASTNAME "_" STUDENT_ID, ".txt")
+                      : NULL;
+    char *path = file ? concat3(outdir, "/", file) : NULL;
     ok = path && write_file(path, &out);
     if (!ok)
-        fprintf(stderr, "calc: cannot write output file in '%s'\n", outdir);
+        fprintf(stderr, "calc: cannot write output file '%s'\n", path ? path : outdir);
 
     free(path);
+    free(file);
     free(base);
     free(out.data);
+    return ok;
+}
+
+/* -d mode: evaluates every *.txt file directly inside dir. readdir() lists a
+ * single folder, so subfolders are never entered, and stat() skips folders
+ * whose names happen to end in ".txt". One bad file does not stop the rest,
+ * but it still makes the exit code non-zero. */
+static int process_dir(const char *dir, const char *outdir) {
+    DIR *d = opendir(dir);
+    if (!d) {
+        fprintf(stderr, "calc: cannot open input folder '%s'\n", dir);
+        return 0;
+    }
+    int ok = 1;
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL) {
+        size_t n = strlen(e->d_name);
+        if (n < 4 || strcmp(e->d_name + n - 4, ".txt") != 0)
+            continue;
+        char *path = concat3(dir, "/", e->d_name);
+        struct stat st;
+        if (!path) {
+            fprintf(stderr, "calc: out of memory\n");
+            ok = 0;
+        } else if (stat(path, &st) == 0 && S_ISREG(st.st_mode) && !process_file(path, outdir)) {
+            ok = 0;
+        }
+        free(path);
+    }
+    closedir(d);
     return ok;
 }
 
@@ -440,39 +495,78 @@ static int process_file(const char *input, const char *outdir) {
 /* ------------------------------------------------------------------------ */
 
 static void usage(void) {
-    fprintf(stderr, "usage: calc -o OUTDIR input.txt\n");
+    fprintf(stderr,
+            "usage: calc [-d DIR | --dir DIR] [-o OUTDIR | --output-dir OUTDIR] [input.txt]\n");
 }
 
 int main(int argc, char **argv) {
+    const char *dir = NULL;
     const char *outdir = NULL;
     const char *input = NULL;
 
     for (int k = 1; k < argc; k++) {
-        if (strcmp(argv[k], "-o") == 0 || strcmp(argv[k], "--output-dir") == 0) {
+        const char *a = argv[k];
+        int is_dir = strcmp(a, "-d") == 0 || strcmp(a, "--dir") == 0;
+        int is_out = strcmp(a, "-o") == 0 || strcmp(a, "--output-dir") == 0;
+        if (is_dir || is_out) {
             if (k + 1 >= argc) {
-                fprintf(stderr, "calc: %s needs a folder name\n", argv[k]);
+                fprintf(stderr, "calc: %s needs a folder name\n", a);
                 return 1;
             }
-            outdir = argv[++k];
-        } else if (argv[k][0] == '-') {
-            fprintf(stderr, "calc: unknown option '%s'\n", argv[k]);
+            if (is_dir)
+                dir = argv[++k];
+            else
+                outdir = argv[++k];
+        } else if (a[0] == '-') {
+            fprintf(stderr, "calc: unknown option '%s'\n", a);
             usage();
             return 1;
         } else if (!input) {
-            input = argv[k];
+            input = a;
         } else {
             fprintf(stderr, "calc: only one input file can be given\n");
             return 1;
         }
     }
 
-    if (!input || !outdir) {
+    /* There must be exactly one source: a folder (-d) or a single file. */
+    if ((dir != NULL) == (input != NULL)) {
         usage();
         return 1;
     }
-    if (!ensure_dir(outdir)) {
-        fprintf(stderr, "calc: cannot create output folder '%s'\n", outdir);
+
+    /* The input is checked before anything is created, so a mistyped name
+     * fails with a message and does not leave an empty output folder. */
+    struct stat st;
+    const char *src = dir ? dir : input;
+    if (stat(src, &st) != 0 || !(dir ? S_ISDIR(st.st_mode) : S_ISREG(st.st_mode))) {
+        fprintf(stderr, "calc: input %s '%s' not found\n", dir ? "folder" : "file", src);
         return 1;
     }
-    return process_file(input, outdir) ? 0 : 1;
+
+    /* Without -o, results go to <input_base>_<name>_<id> in the current
+     * folder, where input_base comes from the file name or, with -d, from
+     * the folder name. */
+    char *base = NULL;
+    char *default_out = NULL;
+    if (!outdir) {
+        base = dir ? dir_base(dir) : input_base(input);
+        default_out = base ? concat3(base, "_" STUDENT_NAME "_", STUDENT_ID) : NULL;
+        if (!default_out) {
+            fprintf(stderr, "calc: out of memory\n");
+            free(base);
+            return 1;
+        }
+        outdir = default_out;
+    }
+
+    int ok = ensure_dir(outdir);
+    if (!ok)
+        fprintf(stderr, "calc: cannot create output folder '%s'\n", outdir);
+    else
+        ok = dir ? process_dir(dir, outdir) : process_file(input, outdir);
+
+    free(default_out);
+    free(base);
+    return ok ? 0 : 1;
 }
