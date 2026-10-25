@@ -108,6 +108,7 @@ typedef enum {
     TOK_MINUS,
     TOK_STAR,
     TOK_SLASH,
+    TOK_POW,     /* "**" */
     TOK_LPAREN,
     TOK_RPAREN,
     TOK_EOL,     /* end of the line: a '\n' or the end of the file */
@@ -159,7 +160,16 @@ static void next_token(Parser *p) {
             switch (c) {
             case '+': t.type = TOK_PLUS; break;
             case '-': t.type = TOK_MINUS; break;
-            case '*': t.type = TOK_STAR; break;
+            case '*':
+                /* "**" is one token, so in "2 ** ** 3" the second "**" is
+                 * the unexpected operator, reported at its first '*'. */
+                if (p->i + 1 < p->len && p->src[p->i + 1] == '*') {
+                    t.type = TOK_POW;
+                    p->i++;
+                } else {
+                    t.type = TOK_STAR;
+                }
+                break;
             case '/': t.type = TOK_SLASH; break;
             case '(': t.type = TOK_LPAREN; break;
             case ')': t.type = TOK_RPAREN; break;
@@ -187,15 +197,17 @@ static void fail(Parser *p, size_t pos) {
 /* Grammar, one function per precedence level, from lowest to highest:
  *
  *   expr    := term { ('+' | '-') term }
- *   term    := primary { ('*' | '/') primary }
+ *   term    := power { ('*' | '/') power }
+ *   power   := primary [ '**' power ]
  *   primary := NUMBER | '(' expr ')'
  *
  * Precedence comes from the call order: parse_expr() asks parse_term() for
  * each operand, and parse_term() only returns when no more '*' or '/'
  * follows. So in 3 + 2 * 5 the term 2 * 5 is finished before the + is
- * applied, which is exactly "* before +". Parentheses go back to the top
- * level (expr), so anything inside them is a single operand for the
- * operators around them.
+ * applied, which is exactly "* before +". In the same way parse_term() gets
+ * its operands from parse_power(), so ** binds tighter than * and /.
+ * Parentheses go back to the top level (expr), so anything inside them is a
+ * single operand for the operators around them.
  *
  * Every function evaluates while it parses, and all of them stop as soon as
  * p->failed is set, so the reported error is the first one from the left. */
@@ -229,9 +241,48 @@ static long long parse_primary(Parser *p) {
     return 0;
 }
 
-/* term := primary { ('*' | '/') primary } */
+/* Exponentiation by squaring: about log2(exp) multiplications, so even
+ * 1 ** 1000000000000 is instant. The base is squared only while more
+ * exponent bits remain, so it never grows past what the result needs (the
+ * tests never overflow the result itself). */
+static long long int_pow(long long base, long long exp) {
+    long long result = 1;
+    while (exp > 0) {
+        if (exp & 1)
+            result *= base;
+        exp >>= 1;
+        if (exp > 0)
+            base *= base;
+    }
+    return result; /* exp == 0 gives 1, including 0 ** 0 */
+}
+
+/* power := primary [ '**' power ]
+ * ** is right-associative because, after reading "**", this function calls
+ * itself for the exponent: the whole rest (3 ** 2 in 2 ** 3 ** 2) becomes
+ * the exponent before anything is computed, so 2 ** 3 ** 2 = 2 ** 9 = 512.
+ * The loops used for the other levels would group to the left instead. */
+static long long parse_power(Parser *p) {
+    long long base = parse_primary(p);
+    if (p->failed || p->tok.type != TOK_POW)
+        return base;
+    next_token(p);
+    size_t exp_pos = p->tok.pos; /* start of the exponent, for the error below */
+    long long exp = parse_power(p);
+    if (p->failed)
+        return 0;
+    if (exp < 0) {
+        /* An int to a negative int power is not an integer. The rules report
+         * it at the start of the exponent, e.g. at '(' in 2 ** (1 - 2). */
+        fail(p, exp_pos);
+        return 0;
+    }
+    return int_pow(base, exp);
+}
+
+/* term := power { ('*' | '/') power } */
 static long long parse_term(Parser *p) {
-    long long v = parse_primary(p);
+    long long v = parse_power(p);
     while (!p->failed && (p->tok.type == TOK_STAR || p->tok.type == TOK_SLASH)) {
         TokenType op = p->tok.type;
         next_token(p);
@@ -239,7 +290,7 @@ static long long parse_term(Parser *p) {
          * division by zero is reported there, e.g. at the '(' of
          * 8 / (4 - 2 * 2), even though the zero is only known afterwards. */
         size_t rhs_pos = p->tok.pos;
-        long long rhs = parse_primary(p);
+        long long rhs = parse_power(p);
         if (p->failed)
             return 0;
         if (op == TOK_STAR) {
@@ -277,6 +328,21 @@ static int evaluate(const char *src, size_t len, Buffer *out) {
     Parser p = {.src = src, .len = len};
 
     while (p.i < len) {
+        /* Look at the first non-blank character: '#' there makes the whole
+         * line a comment. A '#' after a token is not checked here, so the
+         * tokenizer reports it as an invalid character. */
+        size_t j = p.i;
+        while (j < len && (src[j] == ' ' || src[j] == '\t'))
+            j++;
+        if (j < len && src[j] == '#') {
+            /* Jump straight to the next line. The comment's characters still
+             * count for later positions, because positions are offsets into
+             * the whole file, not into a line. */
+            const char *nl = memchr(src + j, '\n', len - j);
+            p.i = nl ? (size_t)(nl - src) + 1 : len;
+            continue;
+        }
+
         next_token(&p);
         if (p.tok.type != TOK_EOL) { /* an empty line gives no output */
             long long v = parse_expr(&p);
