@@ -106,6 +106,10 @@ typedef enum {
     TOK_NUMBER,
     TOK_PLUS,
     TOK_MINUS,
+    TOK_STAR,
+    TOK_SLASH,
+    TOK_LPAREN,
+    TOK_RPAREN,
     TOK_EOL,     /* end of the line: a '\n' or the end of the file */
     TOK_INVALID  /* a character that cannot start any token */
 } TokenType;
@@ -151,14 +155,19 @@ static void next_token(Parser *p) {
             }
             t.type = TOK_NUMBER;
             t.value = v;
-        } else if (c == '+') {
-            t.type = TOK_PLUS;
-            p->i++;
-        } else if (c == '-') {
-            t.type = TOK_MINUS;
-            p->i++;
+        } else {
+            switch (c) {
+            case '+': t.type = TOK_PLUS; break;
+            case '-': t.type = TOK_MINUS; break;
+            case '*': t.type = TOK_STAR; break;
+            case '/': t.type = TOK_SLASH; break;
+            case '(': t.type = TOK_LPAREN; break;
+            case ')': t.type = TOK_RPAREN; break;
+            default: break; /* stays TOK_INVALID and is not consumed */
+            }
+            if (t.type != TOK_INVALID)
+                p->i++;
         }
-        /* anything else stays TOK_INVALID and is not consumed */
     }
     p->tok = t;
 }
@@ -175,28 +184,86 @@ static void fail(Parser *p, size_t pos) {
     }
 }
 
-/* primary := NUMBER */
+/* Grammar, one function per precedence level, from lowest to highest:
+ *
+ *   expr    := term { ('+' | '-') term }
+ *   term    := primary { ('*' | '/') primary }
+ *   primary := NUMBER | '(' expr ')'
+ *
+ * Precedence comes from the call order: parse_expr() asks parse_term() for
+ * each operand, and parse_term() only returns when no more '*' or '/'
+ * follows. So in 3 + 2 * 5 the term 2 * 5 is finished before the + is
+ * applied, which is exactly "* before +". Parentheses go back to the top
+ * level (expr), so anything inside them is a single operand for the
+ * operators around them.
+ *
+ * Every function evaluates while it parses, and all of them stop as soon as
+ * p->failed is set, so the reported error is the first one from the left. */
+
+static long long parse_expr(Parser *p);
+
 static long long parse_primary(Parser *p) {
-    if (p->tok.type != TOK_NUMBER) {
-        /* We expected an operand and see something else (an operator, the end
-         * of the line, an invalid character): report where that token starts. */
-        fail(p, p->tok.pos);
-        return 0;
+    if (p->tok.type == TOK_NUMBER) {
+        long long v = p->tok.value;
+        next_token(p);
+        return v;
     }
-    long long v = p->tok.value;
-    next_token(p);
+    if (p->tok.type == TOK_LPAREN) {
+        next_token(p);
+        long long v = parse_expr(p);
+        if (p->failed)
+            return 0;
+        if (p->tok.type != TOK_RPAREN) {
+            /* The inner expression stopped at something that is not ')': for a
+             * missing ')' that is the end of the line, so the error is at the
+             * '\n' (as required); otherwise it is the unexpected token. */
+            fail(p, p->tok.pos);
+            return 0;
+        }
+        next_token(p);
+        return v;
+    }
+    /* We expected an operand and see something else (an operator, ')', the
+     * end of the line, an invalid character): report where that token starts. */
+    fail(p, p->tok.pos);
+    return 0;
+}
+
+/* term := primary { ('*' | '/') primary } */
+static long long parse_term(Parser *p) {
+    long long v = parse_primary(p);
+    while (!p->failed && (p->tok.type == TOK_STAR || p->tok.type == TOK_SLASH)) {
+        TokenType op = p->tok.type;
+        next_token(p);
+        /* Remember where the right operand starts before parsing it: a
+         * division by zero is reported there, e.g. at the '(' of
+         * 8 / (4 - 2 * 2), even though the zero is only known afterwards. */
+        size_t rhs_pos = p->tok.pos;
+        long long rhs = parse_primary(p);
+        if (p->failed)
+            return 0;
+        if (op == TOK_STAR) {
+            v *= rhs;
+        } else if (rhs == 0) {
+            fail(p, rhs_pos);
+            return 0;
+        } else {
+            v /= rhs; /* C integer division truncates toward zero: -7 / 2 is -3 */
+        }
+    }
     return v;
 }
 
-/* expr := primary { ('+' | '-') primary }
+/* expr := term { ('+' | '-') term }
  * The loop applies each operator as soon as its right operand is read, so
- * 10 - 3 + 1 is computed as (10 - 3) + 1: + and - are left-associative. */
+ * 10 - 3 + 1 is computed as (10 - 3) + 1: + and - are left-associative
+ * (the same loop makes * and / left-associative in parse_term). */
 static long long parse_expr(Parser *p) {
-    long long v = parse_primary(p);
+    long long v = parse_term(p);
     while (!p->failed && (p->tok.type == TOK_PLUS || p->tok.type == TOK_MINUS)) {
         TokenType op = p->tok.type;
         next_token(p);
-        long long rhs = parse_primary(p);
+        long long rhs = parse_term(p);
         if (p->failed)
             return 0;
         v = (op == TOK_PLUS) ? v + rhs : v - rhs;
