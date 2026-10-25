@@ -5,15 +5,32 @@
 /*
  * calc - evaluates arithmetic expressions read from text files.
  *
+ *   calc [-d DIR | --dir DIR] [-o OUTDIR | --output-dir OUTDIR] [input.txt]
+ *
  * Every non-blank line of an input file is one expression. The results are
- * written to an output file, one per line, in the same order.
+ * written to an output file, one per line, in the same order. If any line
+ * has an error, the output file holds only "ERROR:<pos>" for the first one.
+ *
+ * How it works:
+ *   1. read_file() loads the whole input file into memory at once;
+ *   2. next_token() cuts it into tokens and knows where each token starts;
+ *   3. the parse_*() functions check the grammar and compute the value in
+ *      the same pass (recursive descent, one function per precedence level);
+ *   4. evaluate() does this for every line and collects the results in a
+ *      Buffer, which is written to the output file only at the end.
+ *
+ * Large files: the input is read with a single fread, the tokenizer walks
+ * that buffer once without copying lines out of it, comment lines are
+ * skipped with memchr, and the results go into a buffer that doubles its
+ * size when full. So the work grows linearly with the file size.
  */
 
-#define _POSIX_C_SOURCE 200809L /* mkdir() and struct stat are POSIX, not ISO C */
+#define _POSIX_C_SOURCE 200809L /* mkdir(), opendir() and stat() are POSIX, not ISO C */
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 #include <dirent.h>
 #include <sys/stat.h>
 
@@ -100,6 +117,56 @@ static int write_file(const char *path, const Buffer *b) {
 }
 
 /* ------------------------------------------------------------------------ */
+/* Numbers                                                                   */
+/* ------------------------------------------------------------------------ */
+
+/* Every value remembers whether it is an integer or a float. A number
+ * written without '.' is an integer; apply() decides the kind of each
+ * result. The kind also decides the printing: integers with %lld, floats
+ * with %.15g (so the float 1.25 * 4 prints as 5). */
+typedef struct {
+    int is_float;
+    long long i; /* the value when is_float == 0 */
+    double f;    /* the value when is_float == 1 */
+} Value;
+
+static Value int_value(long long i) {
+    Value v = {0, i, 0.0};
+    return v;
+}
+
+static Value float_value(double f) {
+    Value v = {1, 0, f};
+    return v;
+}
+
+static double as_double(Value v) {
+    return v.is_float ? v.f : (double)v.i;
+}
+
+static int is_digit(char c) {
+    return c >= '0' && c <= '9';
+}
+
+/* Converts the n characters at s (digits '.' digits) to a double. strtod()
+ * gives the correctly rounded value, which adding digits up by hand would
+ * not. It gets a copy that ends right after the number, so it can never
+ * read further and, for example, take the "e3" of "1.5e3" as an exponent:
+ * the rules say that this 'e' is an invalid character. */
+static double span_to_double(const char *s, size_t n) {
+    char small[64];
+    char *buf = n < sizeof small ? small : malloc(n + 1);
+    if (!buf)
+        return 0.0;
+    memcpy(buf, s, n);
+    buf[n] = '\0';
+    double d = strtod(buf, NULL);
+    if (buf != small)
+        free(buf);
+    return d;
+}
+
+/* ------------------------------------------------------------------------ */
 /* Tokenizer                                                                 */
 /* ------------------------------------------------------------------------ */
 
@@ -118,8 +185,8 @@ typedef enum {
 
 typedef struct {
     TokenType type;
-    size_t pos;      /* 1-based position of the token's first character */
-    long long value; /* only for TOK_NUMBER */
+    size_t pos;  /* 1-based position of the token's first character */
+    Value value; /* only for TOK_NUMBER */
 } Token;
 
 typedef struct {
@@ -139,7 +206,7 @@ static void next_token(Parser *p) {
     while (p->i < p->len && (p->src[p->i] == ' ' || p->src[p->i] == '\t'))
         p->i++;
 
-    Token t = {TOK_INVALID, p->i + 1, 0};
+    Token t = {TOK_INVALID, p->i + 1, {0, 0, 0.0}};
     if (p->i >= p->len || p->src[p->i] == '\n') {
         /* The end of the line is a token as well. When an operand is missing
          * at the end of a line, the parser is looking at this token, so the
@@ -149,14 +216,33 @@ static void next_token(Parser *p) {
         t.type = TOK_EOL;
     } else {
         char c = p->src[p->i];
-        if (c >= '0' && c <= '9') {
-            long long v = 0;
-            while (p->i < p->len && p->src[p->i] >= '0' && p->src[p->i] <= '9') {
-                v = v * 10 + (p->src[p->i] - '0');
+        if (is_digit(c)) {
+            /* A number is digits, optionally followed by '.' and more digits.
+             * The integer part is collected in an unsigned variable, which
+             * wraps instead of causing undefined behaviour if a float has a
+             * very long integer part (integers in the tests always fit). */
+            size_t start = p->i;
+            unsigned long long v = 0;
+            while (p->i < p->len && is_digit(p->src[p->i])) {
+                v = v * 10 + (unsigned long long)(p->src[p->i] - '0');
                 p->i++;
             }
-            t.type = TOK_NUMBER;
-            t.value = v;
+            if (p->i < p->len && p->src[p->i] == '.') {
+                if (p->i + 1 < p->len && is_digit(p->src[p->i + 1])) {
+                    p->i++;
+                    while (p->i < p->len && is_digit(p->src[p->i]))
+                        p->i++;
+                    t.type = TOK_NUMBER;
+                    t.value = float_value(span_to_double(p->src + start, p->i - start));
+                } else {
+                    /* "5." is not a number. The rules put this error on the
+                     * '.', so the invalid token reported is the '.' itself. */
+                    t.pos = p->i + 1;
+                }
+            } else {
+                t.type = TOK_NUMBER;
+                t.value = int_value((long long)v);
+            }
         } else {
             switch (c) {
             case '+': t.type = TOK_PLUS; break;
@@ -213,25 +299,25 @@ static void fail(Parser *p, size_t pos) {
  * Every function evaluates while it parses, and all of them stop as soon as
  * p->failed is set, so the reported error is the first one from the left. */
 
-static long long parse_expr(Parser *p);
+static Value parse_expr(Parser *p);
 
-static long long parse_primary(Parser *p) {
+static Value parse_primary(Parser *p) {
     if (p->tok.type == TOK_NUMBER) {
-        long long v = p->tok.value;
+        Value v = p->tok.value;
         next_token(p);
         return v;
     }
     if (p->tok.type == TOK_LPAREN) {
         next_token(p);
-        long long v = parse_expr(p);
+        Value v = parse_expr(p);
         if (p->failed)
-            return 0;
+            return v;
         if (p->tok.type != TOK_RPAREN) {
             /* The inner expression stopped at something that is not ')': for a
              * missing ')' that is the end of the line, so the error is at the
              * '\n' (as required); otherwise it is the unexpected token. */
             fail(p, p->tok.pos);
-            return 0;
+            return v;
         }
         next_token(p);
         return v;
@@ -239,7 +325,7 @@ static long long parse_primary(Parser *p) {
     /* We expected an operand and see something else (an operator, ')', the
      * end of the line, an invalid character): report where that token starts. */
     fail(p, p->tok.pos);
-    return 0;
+    return int_value(0);
 }
 
 /* Exponentiation by squaring: about log2(exp) multiplications, so even
@@ -258,50 +344,109 @@ static long long int_pow(long long base, long long exp) {
     return result; /* exp == 0 gives 1, including 0 ** 0 */
 }
 
+/* Computes a op b for every binary operator.
+ *
+ * Integer or float: if both operands are integers, the operation stays in
+ * long long, so the result is exact and / truncates toward zero like C
+ * (7 / 2 is 3, (0 - 7) / 2 is -3). If either operand is a float, both are
+ * converted to double and the result is a float (7 / 2.0 is 3.5).
+ *
+ * Error positions:
+ *   - division by zero: the start of the right operand (rhs_pos), because
+ *     the zero is a property of that operand, e.g. '(' in 8 / (4 - 4);
+ *   - an integer raised to a negative integer has no integer result: the
+ *     start of the exponent (rhs_pos again), e.g. '(' in 2 ** (1 - 2);
+ *   - a float result that is inf or NaN: the operator (op_pos), because
+ *     both operands were fine and the operation produced it, e.g. the
+ *     ** in 10.0 ** 400 or in (0 - 8) ** 0.5. */
+static Value apply(Parser *p, TokenType op, Value a, Value b, size_t op_pos, size_t rhs_pos) {
+    if (!a.is_float && !b.is_float) {
+        switch (op) {
+        case TOK_PLUS:
+            return int_value(a.i + b.i);
+        case TOK_MINUS:
+            return int_value(a.i - b.i);
+        case TOK_STAR:
+            return int_value(a.i * b.i);
+        case TOK_SLASH:
+            if (b.i == 0) {
+                fail(p, rhs_pos);
+                return a;
+            }
+            return int_value(a.i / b.i);
+        default: /* TOK_POW */
+            if (b.i < 0) {
+                fail(p, rhs_pos);
+                return a;
+            }
+            return int_value(int_pow(a.i, b.i));
+        }
+    }
+
+    double x = as_double(a), y = as_double(b), r;
+    switch (op) {
+    case TOK_PLUS:
+        r = x + y;
+        break;
+    case TOK_MINUS:
+        r = x - y;
+        break;
+    case TOK_STAR:
+        r = x * y;
+        break;
+    case TOK_SLASH:
+        /* 1.5 / 0.0 would give inf, but the rules call it a division by
+         * zero, so the zero is checked before dividing. */
+        if (y == 0.0) {
+            fail(p, rhs_pos);
+            return a;
+        }
+        r = x / y;
+        break;
+    default: /* TOK_POW */
+        r = pow(x, y);
+        break;
+    }
+    if (!isfinite(r)) {
+        fail(p, op_pos);
+        return a;
+    }
+    return float_value(r);
+}
+
 /* power := primary [ '**' power ]
  * ** is right-associative because, after reading "**", this function calls
  * itself for the exponent: the whole rest (3 ** 2 in 2 ** 3 ** 2) becomes
  * the exponent before anything is computed, so 2 ** 3 ** 2 = 2 ** 9 = 512.
  * The loops used for the other levels would group to the left instead. */
-static long long parse_power(Parser *p) {
-    long long base = parse_primary(p);
+static Value parse_power(Parser *p) {
+    Value base = parse_primary(p);
     if (p->failed || p->tok.type != TOK_POW)
         return base;
+    size_t op_pos = p->tok.pos;
     next_token(p);
-    size_t exp_pos = p->tok.pos; /* start of the exponent, for the error below */
-    long long exp = parse_power(p);
+    size_t exp_pos = p->tok.pos; /* start of the exponent, for errors in apply() */
+    Value exp = parse_power(p);
     if (p->failed)
-        return 0;
-    if (exp < 0) {
-        /* An int to a negative int power is not an integer. The rules report
-         * it at the start of the exponent, e.g. at '(' in 2 ** (1 - 2). */
-        fail(p, exp_pos);
-        return 0;
-    }
-    return int_pow(base, exp);
+        return base;
+    return apply(p, TOK_POW, base, exp, op_pos, exp_pos);
 }
 
 /* term := power { ('*' | '/') power } */
-static long long parse_term(Parser *p) {
-    long long v = parse_power(p);
+static Value parse_term(Parser *p) {
+    Value v = parse_power(p);
     while (!p->failed && (p->tok.type == TOK_STAR || p->tok.type == TOK_SLASH)) {
         TokenType op = p->tok.type;
+        size_t op_pos = p->tok.pos;
         next_token(p);
         /* Remember where the right operand starts before parsing it: a
-         * division by zero is reported there, e.g. at the '(' of
-         * 8 / (4 - 2 * 2), even though the zero is only known afterwards. */
+         * division by zero is reported there, even though the zero is only
+         * known after the whole operand has been computed. */
         size_t rhs_pos = p->tok.pos;
-        long long rhs = parse_power(p);
+        Value rhs = parse_power(p);
         if (p->failed)
-            return 0;
-        if (op == TOK_STAR) {
-            v *= rhs;
-        } else if (rhs == 0) {
-            fail(p, rhs_pos);
-            return 0;
-        } else {
-            v /= rhs; /* C integer division truncates toward zero: -7 / 2 is -3 */
-        }
+            break;
+        v = apply(p, op, v, rhs, op_pos, rhs_pos);
     }
     return v;
 }
@@ -310,15 +455,17 @@ static long long parse_term(Parser *p) {
  * The loop applies each operator as soon as its right operand is read, so
  * 10 - 3 + 1 is computed as (10 - 3) + 1: + and - are left-associative
  * (the same loop makes * and / left-associative in parse_term). */
-static long long parse_expr(Parser *p) {
-    long long v = parse_term(p);
+static Value parse_expr(Parser *p) {
+    Value v = parse_term(p);
     while (!p->failed && (p->tok.type == TOK_PLUS || p->tok.type == TOK_MINUS)) {
         TokenType op = p->tok.type;
+        size_t op_pos = p->tok.pos;
         next_token(p);
-        long long rhs = parse_term(p);
+        size_t rhs_pos = p->tok.pos;
+        Value rhs = parse_term(p);
         if (p->failed)
-            return 0;
-        v = (op == TOK_PLUS) ? v + rhs : v - rhs;
+            break;
+        v = apply(p, op, v, rhs, op_pos, rhs_pos);
     }
     return v;
 }
@@ -346,14 +493,15 @@ static int evaluate(const char *src, size_t len, Buffer *out) {
 
         next_token(&p);
         if (p.tok.type != TOK_EOL) { /* an empty line gives no output */
-            long long v = parse_expr(&p);
+            Value v = parse_expr(&p);
             /* A complete expression must end exactly at the end of the line. */
             if (!p.failed && p.tok.type != TOK_EOL)
                 fail(&p, p.tok.pos);
             if (p.failed)
                 break;
-            char num[32];
-            int n = snprintf(num, sizeof num, "%lld\n", v);
+            char num[40];
+            int n = v.is_float ? snprintf(num, sizeof num, "%.15g\n", v.f)
+                               : snprintf(num, sizeof num, "%lld\n", v.i);
             if (!buffer_append(out, num, (size_t)n))
                 return 0;
         }
